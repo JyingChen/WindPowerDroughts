@@ -1,0 +1,20 @@
+# 原始数据与本地生成结果不上传
+/data/
+/outputs/
+
+# Python缓存、测试缓存和本地环境
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# 本地编辑器、代理配置与凭据目录
+/.vscode/
+/.agents/
+/.codex/
+/.aws/
+Thumbs.db
+.DS_Store
