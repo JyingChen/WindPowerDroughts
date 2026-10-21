@@ -2,6 +2,20 @@
 /data/
 /outputs/
 
+# 无论存放在哪个目录，均排除大型科学数据与二进制计算结果
+*.nc
+*.nc4
+*.cdf
+*.netcdf
+*.grib
+*.grib2
+*.h5
+*.hdf5
+*.zarr/
+*.npy
+*.npz
+*.pkl
+
 # Python缓存、测试缓存和本地环境
 __pycache__/
 *.py[cod]

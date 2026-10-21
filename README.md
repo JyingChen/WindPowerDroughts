@@ -1,6 +1,6 @@
 # 风旱分析项目
 
-原始 `data/` 和本地生成的 `outputs/` 不随Git仓库上传。克隆后需自行创建 `data/`，放入 `wind_data_trimmed.nc`；数据结构和参数假设见下方分析文档。
+原始 `data/` 和本地生成的 `outputs/` 不随Git仓库上传；其他目录中的NetCDF、GRIB、HDF5、Zarr、NumPy数组等二进制数据和计算结果也被忽略。克隆后需自行创建 `data/`，放入 `wind_data_trimmed.nc`；数据结构和参数假设见下方分析文档。
 
 ```text
 code/                         源码
