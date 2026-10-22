@@ -1,6 +1,6 @@
-"""功能：在单一阈值情景内识别连续低CF事件。
-输入：日CF、逐日阈值和允许恢复天数；输出：保持跨年event_id的事件表。
-流程：找低值日、检查间隙、构建事件；注意：缺测必断开，持续天数不用于等级分类。
+"""功能：识别逐小时站点LPW，并保留原日尺度连续事件识别。
+输入：单站小时CF、固定阈值及分级边界，或旧日CF与逐日阈值；输出：事件表。
+流程：划分严格连续低值段、筛选时长、计算强度及等级；注意：小时LPW不合并恢复，缺测必断开。
 """
 import numpy as np
 import pandas as pd
@@ -74,3 +74,83 @@ def identify_events(cf, threshold, level, threshold_type="percentile", merge_rec
     columns = EVENT_COLUMNS + (["threshold_deficit_energy_kwh_estimate", "full_output_gap_energy_kwh"]
                                if installed_capacity_kw is not None else [])
     return pd.DataFrame(rows, columns=columns)
+
+
+def classify_lpw_duration(hours, lower_bounds=(4, 8, 12, 24), labels=("LPW1", "LPW2", "LPW3", "LPW4")):
+    """按左闭右开区间赋予互斥等级；末档无上限，小于最低时长返回空字符串。"""
+    bounds = np.asarray(lower_bounds, dtype=float)
+    if (bounds.ndim != 1 or not len(bounds) or len(bounds) != len(labels)
+            or not np.isfinite(bounds).all() or (bounds < 1).any()
+            or (np.diff(bounds) <= 0).any() or len(set(labels)) != len(labels)
+            or any(not isinstance(label, str) or not label or label == "ALL" for label in labels)):
+        raise ValueError("LPW时长下界须为递增正数，标签须唯一且不能为ALL")
+    values = np.asarray(hours)
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("事件时长须为有限非负数")
+    codes = np.searchsorted(bounds, values, side="right") - 1
+    return np.where(codes >= 0, np.asarray(labels, dtype=object)[np.maximum(codes, 0)], "")
+
+
+def hourly_lpw_masks(cf, threshold, cause=None, exclude_cut_out=True):
+    """校验单站小时序列并返回时间、有效及严格低CF掩码；缺时标签不自动插值。"""
+    if cf.dims != ("time",):
+        raise ValueError("小时事件输入须为单站一维time序列")
+    # pandas/xarray可能使用us或ns分辨率；统一到ns再比较整数时间差。
+    index = pd.DatetimeIndex(cf.time.values).as_unit("ns")
+    if (index.empty or index.hasnans or index.has_duplicates or not index.is_monotonic_increasing
+            or not (index == index.floor("h")).all()):
+        raise ValueError("小时输入须非空、整点、有序且无重复")
+    if not np.isfinite(threshold) or not 0 < threshold <= 1:
+        raise ValueError("小时固定CF阈值须在(0,1]")
+    values = cf.values
+    if ((values[np.isfinite(values)] < 0) | (values[np.isfinite(values)] > 1)).any():
+        raise ValueError("有效CF须在[0,1]")
+    valid = np.isfinite(values)
+    if cause is not None:
+        if cause.dims != cf.dims or not cause.time.equals(cf.time):
+            raise ValueError("成因码须与小时CF完全对齐")
+        if not np.isin(cause.values, [-1, 0, 1, 2]).all():
+            raise ValueError("发现未知成因码")
+        valid &= cause.values != -1
+        if exclude_cut_out:
+            valid &= cause.values != 2
+    # 与原数组同精度比较，恰好等于阈值的观测不算低CF。
+    return index, valid, valid & (values < threshold)
+
+
+def identify_hourly_lpw(cf, threshold, level, *, cause=None, exclude_cut_out=True, min_hours=4,
+                        lower_bounds=(4, 8, 12, 24), labels=("LPW1", "LPW2", "LPW3", "LPW4"),
+                        station_id="regional"):
+    """识别连续达到min_hours的LPW（默认4小时）；每标签代表1小时，结束为末个低CF标签。"""
+    classify_lpw_duration([], lower_bounds, labels)
+    if not isinstance(min_hours, int) or min_hours < 1 or lower_bounds[0] != min_hours:
+        raise ValueError("最小时数须为正整数且等于首档分级下界")
+    index, valid, low = hourly_lpw_masks(cf, threshold, cause, exclude_cut_out)
+    # 相邻低值记录若缺了时间标签，也必须分成两场，不能跨缺小时连接。
+    gaps = np.diff(index.asi8) != pd.Timedelta(hours=1).value
+    starts = np.flatnonzero(low & (~np.r_[False, low[:-1]] | np.r_[False, gaps]))
+    ends = np.flatnonzero(low & (~np.r_[low[1:], False] | np.r_[gaps, False]))
+    durations = ends - starts + 1
+    keep = durations >= min_hours
+    # 前缀和和分段最小值避免逐场切片，适用于数百万场事件。
+    prefix = np.r_[0., np.cumsum(np.where(valid, cf.values, 0.), dtype=np.float64)]
+    minima = np.minimum.reduceat(np.where(low, cf.values, np.inf), starts) if len(starts) else np.array([])
+    starts, ends, durations, minima = starts[keep], ends[keep], durations[keep], minima[keep]
+    total_cf = prefix[ends + 1] - prefix[starts]
+    cut_out = np.zeros(len(index), dtype=int) if cause is None else (cause.values == 2).astype(int)
+    cut_prefix = np.r_[0, np.cumsum(cut_out)]
+    cut_hours = cut_prefix[ends+1]-cut_prefix[starts]
+    preceding = np.maximum(starts - 1, 0)
+    following = np.minimum(ends + 1, len(index) - 1)
+    grade = classify_lpw_duration(durations, lower_bounds, labels)
+    return pd.DataFrame(dict(
+        event_id=[f"{level}_{station_id}_{n:06d}" for n in range(1, len(starts)+1)],
+        station_id=str(station_id), threshold_level=level, cf_threshold=threshold,
+        start=index[starts], end=index[ends], end_exclusive=index[ends]+pd.Timedelta(hours=1),
+        duration_hours=durations, valid_observations=durations, lpw_class=grade,
+        mean_cf=total_cf / durations, min_cf=minima,
+        cumulative_cf_deficit=np.maximum(threshold * durations - total_cf, 0.),
+        missing_hours=np.zeros(len(starts), dtype=int), cut_out_hours=cut_hours,
+        missing_before=(starts > 0) & (~valid[preceding] | (index.asi8[starts]-index.asi8[preceding] != pd.Timedelta(hours=1).value)),
+        missing_after=(ends < len(index)-1) & (~valid[following] | (index.asi8[following]-index.asi8[ends] != pd.Timedelta(hours=1).value)),
+        left_boundary=starts == 0, right_boundary=ends == len(index)-1))

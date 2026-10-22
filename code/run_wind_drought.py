@@ -1,7 +1,7 @@
-"""功能：唯一正式入口，组织逐小时风速到CF再到独立阈值情景事件的流程。
+"""功能：唯一正式入口，组织逐小时风速到CF及站点LPW，也可运行旧日尺度分析。
 输入：config.py及原始NetCDF；输出：分次运行的NetCDF、CSV、检查与配置JSON。
-流程：校验/原质量检查、分块外推与CF、聚合、阈值、识别、统计。
-注意：不插值、不按持续时间分级；默认机型为假设，质量检查可单独运行。
+流程：校验/原质量检查、分块外推与CF、按模式调用小时LPW或日尺度识别。
+注意：小时LPW使用固定阈值与互斥时长等级；旧日模式保持原规则，质量检查仍可单独运行。
 """
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -20,6 +20,7 @@ from wind_droughts.spatial import regional_mean, daily_and_rolling
 from wind_droughts.thresholds import build_thresholds, exclusive_daily_labels
 from wind_droughts.events import identify_events
 from wind_droughts.statistics import summarize_events
+from wind_droughts.lpw_analysis import run_hourly_lpw, replot_hourly_lpw
 
 
 def run_legacy_quality():
@@ -59,6 +60,11 @@ def main(argv=None):
     parser.add_argument("--quality-html", action="store_true", help="从已有质量CSV生成HTML报告")
     parser.add_argument("--inspect-only", action="store_true", help="仅扫描结构和数据质量")
     parser.add_argument("--skip-quality", action="store_true", help="跳过原质量CSV重算，仍执行新读取层校验")
+    parser.add_argument("--analysis-mode", choices=["hourly_lpw", "daily"], default=None,
+                        help="覆盖config.ANALYSIS_MODE；daily保留旧日尺度分析")
+    parser.add_argument("--hourly-cf", type=Path, help="复用明确指定的站点小时CF文件，校验机型与高度后识别LPW")
+    parser.add_argument("--skip-maps", action="store_true", help="只计算小时LPW统计，跳过地图")
+    parser.add_argument("--plot-lpw-run", type=Path, help="从已有LPW结果目录重绘地图，不重新识别事件")
     args = parser.parse_args(argv)
     if args.quality_html:
         from quality_control.generate_quality_html import main as generate_quality_html
@@ -66,22 +72,38 @@ def main(argv=None):
         return 0
     if args.quality_only:
         return run_legacy_quality()
+    if args.plot_lpw_run:
+        if args.hourly_cf or args.inspect_only or args.skip_maps:
+            parser.error("--plot-lpw-run不能与--hourly-cf、--inspect-only、--skip-maps同时使用")
+        replot_hourly_lpw(args.plot_lpw_run, config)
+        return 0
+    mode = args.analysis_mode or config.ANALYSIS_MODE
+    if mode not in {"daily", "hourly_lpw"}:
+        raise ValueError("ANALYSIS_MODE只支持hourly_lpw或daily")
+    if args.hourly_cf and (mode != "hourly_lpw" or args.inspect_only):
+        parser.error("--hourly-cf仅适用于hourly_lpw分析，不能与--inspect-only同时使用")
     root = Path(__file__).resolve().parent
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("run_%Y%m%d_%H%M%S_%f")
-    out = (root / config.ANALYSIS_OUTPUT_DIR / stamp).resolve()
+    base_dir = config.LPW_OUTPUT_DIR if mode == "hourly_lpw" else config.ANALYSIS_OUTPUT_DIR
+    out = (root / base_dir / stamp).resolve()
     out.mkdir(parents=True)
     nc_dir, csv_dir = out / "netcdf", out / "tables"
     nc_dir.mkdir()
     csv_dir.mkdir()
     settings = {k: v for k, v in vars(config).items() if k.isupper()}
     save_json(out / "configuration.json", settings)
-    if config.EVENT_INPUT not in ("daily", "rolling7"):
-        raise ValueError("EVENT_INPUT只支持daily或rolling7")
-    if config.EVENT_INPUT == "rolling7" and not config.COMPUTE_ROLLING_7D:
-        raise ValueError("rolling7识别需开启七日滚动计算")
-    capacity = resolve_capacity(config.INSTALLED_CAPACITY_KW, config.RATED_POWER_KW, config.TURBINE_COUNT)
-    if capacity is not None and config.EVENT_INPUT != "daily":
-        raise ValueError("电量仅支持日CF分析；七日滚动含重叠窗口")
+    if args.hourly_cf:
+        run_hourly_lpw(args.hourly_cf, out, config, plot_maps=config.LPW_PLOT_MAPS and not args.skip_maps)
+        return 0
+    capacity = None
+    if mode == "daily":
+        if config.EVENT_INPUT not in ("daily", "rolling7"):
+            raise ValueError("EVENT_INPUT只支持daily或rolling7")
+        if config.EVENT_INPUT == "rolling7" and not config.COMPUTE_ROLLING_7D:
+            raise ValueError("rolling7识别需开启七日滚动计算")
+        capacity = resolve_capacity(config.INSTALLED_CAPACITY_KW, config.RATED_POWER_KW, config.TURBINE_COUNT)
+        if capacity is not None and config.EVENT_INPUT != "daily":
+            raise ValueError("电量仅支持日CF分析；七日滚动含重叠窗口")
     configure_netcdf_cache(config.NETCDF_CHUNK_CACHE_MB)
     with xr.open_dataset((root / config.DATA_PATH).resolve(), engine="netcdf4") as ds:
         wind = read_wind(ds, config.WIND_VARIABLE, config.WIND_SELECTOR, config.COORDINATE_MAP,
@@ -96,7 +118,8 @@ def main(argv=None):
             status = run_legacy_quality()
             if status:
                 return status
-        metadata = dict(event_input=config.EVENT_INPUT, source_height_m=config.SOURCE_HEIGHT_M,
+        metadata = dict(event_input="station_hourly_cf" if mode == "hourly_lpw" else config.EVENT_INPUT,
+            source_height_m=config.SOURCE_HEIGHT_M,
             hub_height_m=config.HUB_HEIGHT_M, shear_alpha=config.SHEAR_ALPHA,
             wind_units_source=report['units_source'], exclude_cut_out_from_analysis=int(config.EXCLUDE_CUT_OUT),
             spatial_weight="cos(latitude); station sampling weights, not installed capacity weights",
@@ -123,12 +146,15 @@ def main(argv=None):
     hourly.attrs.update(metadata)
     hourly.to_netcdf(nc_dir / "regional_hourly_cf.nc", engine="netcdf4")
     daily = daily_and_rolling(hourly.regional_cf, config.MIN_DAILY_VALID_HOURS, config.COMPUTE_ROLLING_7D)
-    series = daily.daily_cf if config.EVENT_INPUT == "daily" else daily.rolling7_cf
-    limits = build_thresholds(series, config.THRESHOLD_TYPE, config.PERCENTILE_LEVELS,
-        config.PERCENTILE_MODE, config.FIXED_CF_THRESHOLD, config.BASELINE_START, config.BASELINE_END)
     daily.attrs.update(metadata)
     daily.attrs['min_daily_valid_hours'] = config.MIN_DAILY_VALID_HOURS
     daily.to_netcdf(nc_dir / "daily_cf.nc", engine="netcdf4")
+    if mode == "hourly_lpw":
+        run_hourly_lpw(nc_dir / "hourly_cf.nc", out, config, plot_maps=config.LPW_PLOT_MAPS and not args.skip_maps)
+        return 0
+    series = daily.daily_cf if config.EVENT_INPUT == "daily" else daily.rolling7_cf
+    limits = build_thresholds(series, config.THRESHOLD_TYPE, config.PERCENTILE_LEVELS,
+        config.PERCENTILE_MODE, config.FIXED_CF_THRESHOLD, config.BASELINE_START, config.BASELINE_END)
     limits.attrs.update(metadata)
     if all(key in limits for key in ("P20", "P10", "P5")):
         limits["exclusive_daily_band"] = exclusive_daily_labels(series, limits)

@@ -3,3 +3,9 @@ pandas>=2.0
 xarray>=2024.1
 netCDF4>=1.6
 pytest>=8
+# 绘图复用utils.py，因此需要其现有绘图与统计依赖
+matplotlib>=3.7
+cartopy>=0.22
+geopandas>=0.14
+seaborn>=0.13
+scipy>=1.10

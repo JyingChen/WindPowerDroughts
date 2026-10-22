@@ -1,10 +1,11 @@
 """功能：保留项目共用的绘图、趋势估计、显著性标记和描述统计工具。
 输入：各工具所需的xarray/数值数据、图形参数和地图文件；输出：图形、统计量或Dataset。
 主要流程：由调用者显式选择工具，完成统计或地图绘制；风旱专用计算位于wind_droughts包。
-注意：原有函数实现与绘图全局设置保持不变，导入依赖cartopy、geopandas等绘图库。
+注意：保留原有工具和绘图全局设置；plot_scat_map支持显式边界路径、分辨率及离线边界选项，导入依赖cartopy、geopandas等绘图库。
 """
 #%%
 import numpy as np
+from pathlib import Path
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
@@ -104,10 +105,11 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
                   extent=None,save_path=None,figsize=(10, 10),
                   title=None,text = None,cbar_label=None,orient='horizontal',
                 cbar_pad = 0.05, cbar_shrink=0.8,cbar_tick_labels=None,cbar_label_pos=[1.05, -0.4],
-                add_south_china_sea=True,south_sea_anchor='axes', south_sea_box=[0.85, -0.01, 0.15, 0.3]
+                add_south_china_sea=True,south_sea_anchor='axes', south_sea_box=[0.85, -0.01, 0.15, 0.3],
+                shp_path=None, dpi=300, add_country_borders=True
                   ):  
     """
-    绘制风速散点分布图（增强版）
+    绘制带latitude/longitude站点坐标的一维数值散点地图，返回fig和ax。
     
     参数:
     -----
@@ -121,6 +123,10 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
         图形大小。
     add_south_china_sea : bool
         是否添加南海子图。
+    shp_path : str或Path或None
+        本地边界文件；None时相对utils.py定位项目data/中国_省.geojson，不依赖启动目录。
+    dpi : int
+        输出图片分辨率；add_country_borders=False时南海子图不下载Natural Earth边界。
     """
     # 提取经纬度和数据
     lons = ds_ti.longitude.values
@@ -128,10 +134,14 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
     data_values = ds_ti.values
     
     # 过滤掉缺失值
-    valid_mask = ~np.isnan(data_values)
+    if data_values.ndim != 1 or lons.shape != data_values.shape or lats.shape != data_values.shape:
+        raise ValueError("散点地图需要一维数据及同形状latitude/longitude坐标")
+    valid_mask = np.isfinite(data_values) & np.isfinite(lons) & np.isfinite(lats)
     lons_valid = lons[valid_mask]
     lats_valid = lats[valid_mask]
     data_valid = data_values[valid_mask]
+    if not len(data_valid):
+        raise ValueError("没有可绘制的有效站点")
     
     print(f"有效数据点数: {len(data_valid)}")
     print(f"数据范围: {data_valid.min():.2f} - {data_valid.max():.2f}")
@@ -147,10 +157,13 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
     ax.set_extent(extent, crs=ccrs.PlateCarree())
     
     # 读取并绘制shapefile
-    shp_path = r"../data/中国_省.geojson"
+    shp_path = Path(shp_path) if shp_path is not None else Path(__file__).resolve().parents[1] / "data" / "中国_省.geojson"
     gdf = gpd.read_file(shp_path)
-    gdf.boundary.plot(ax=ax, transform=ccrs.PlateCarree(), 
-                      edgecolor='black', linewidth=0.7)
+    # 混合GeoJSON中线的boundary是端点，会被画成虚假的蓝色站点；面取边界，线直接保留。
+    boundaries = gdf.geometry.apply(
+        lambda geometry: geometry.boundary if geometry.geom_type in ('Polygon', 'MultiPolygon')
+        else geometry if geometry.geom_type in ('LineString', 'MultiLineString') else None).dropna()
+    boundaries.plot(ax=ax, transform=ccrs.PlateCarree(), color='black', linewidth=0.7)
     
     # 添加经纬度网格
     gl = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5, linestyle='--')
@@ -201,8 +214,7 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
         sub_ax = ax.inset_axes(south_sea_box, transform=ax.transAxes,
                                    projection=ccrs.PlateCarree())
         sub_ax.set_extent([105, 125, 2, 25], crs=ccrs.PlateCarree())
-        gdf.boundary.plot(ax=sub_ax, transform=ccrs.PlateCarree(),
-                          edgecolor='grey', linewidth=0.5)
+        boundaries.plot(ax=sub_ax, transform=ccrs.PlateCarree(), color='grey', linewidth=0.5)
         south_china_sea_mask = (
             (lons_valid >= 105) & (lons_valid <= 125) &
             (lats_valid >= 2) & (lats_valid <= 25)
@@ -214,12 +226,13 @@ def plot_scat_map(ds_ti, levels=None,colors=None,cmap='viridis',norm=None,
             sub_ax.scatter(lons_scs, lats_scs, c=data_scs,
                            cmap=cmap_obj, norm=norm_obj, s=10, alpha=1,
                            edgecolors='none', transform=ccrs.PlateCarree())
-        sub_ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+        if add_country_borders:
+            sub_ax.add_feature(cfeature.BORDERS, linewidth=0.5)
         sub_ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.5, linestyle='--')
         sub_ax.spines['geo'].set_edgecolor('black')
         sub_ax.spines['geo'].set_linewidth(0.6)    
     if save_path is not None:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
         print(f"图形已保存至: {save_path}")
     
     return fig, ax

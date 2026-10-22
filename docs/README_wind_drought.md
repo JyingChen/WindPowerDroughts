@@ -1,5 +1,61 @@
 # 风旱分析程序
 
+## 当前默认：固定阈值逐小时站点LPW
+
+`ANALYSIS_MODE="hourly_lpw"`为当前口径。每个站点在 `CF<0.1`、`CF<0.05`、`CF<0.02` 三个情景下分别识别严格连续至少4小时的低风电事件。恢复1小时、缺测1小时、缺时间标签，以及默认排除的切出停机小时都会中断事件，不进行短暂恢复合并。
+
+时长等级互斥：LPW1为[4,8)小时，LPW2为[8,12)小时，LPW3为[12,24)小时，LPW4为[24,∞)小时。4个连续小时记录00、01、02、03构成4小时事件；`end`是最后一个低CF时间标签03，另存 `end_exclusive=04` 表示右开端点。跨年事件只有一个ID，次数归开始年，LPW小时数按实际年份分配。研究边界事件保留并标记，真实时长可能更长。
+
+运行前激活正确的Conda环境，或使用 `conda run --no-capture-output -n main_env python`；绘图库需要该环境的本地DLL。完整计算：
+
+```powershell
+conda run --no-capture-output -n main_env python code/run_wind_drought.py --skip-quality
+```
+
+复用已保存且参数匹配的站点小时CF，可避免重复计算外推与CF：
+
+```powershell
+conda run --no-capture-output -n main_env python code/run_wind_drought.py --hourly-cf outputs/wind_drought/run_20261021_183538_454692/netcdf/hourly_cf.nc --skip-quality
+```
+
+该历史路径仅适用于已有此本地结果的机器；克隆仓库后先从原始风速完整运行。缓存复用会核对高度、幂律指数、机型参数与CF结构，并记录源文件路径、大小、修改时间及属性。阈值和事件输入均为站点小时CF，日/七日CF不参与本次识别。
+
+每次在 `outputs/lpw/run_*/` 创建新目录：
+
+| 输出 | 含义 |
+| --- | --- |
+| `tables/events_CF010.csv.gz` | CF<0.1全部≥4小时事件，gzip压缩CSV |
+| `tables/events_CF005.csv.gz` | CF<0.05全部≥4小时事件 |
+| `tables/events_CF002.csv.gz` | CF<0.02全部≥4小时事件 |
+| `tables/station_frequency.csv` | 每站×阈值×等级的次数、时长、CF强度及有效小时诊断 |
+| `tables/station_annual_statistics.csv` | 每站每年各等级事件开始次数，及当年低CF/LPW小时 |
+| `tables/lpw_summary.csv` | 同阈值各等级的站点次数汇总及空间均值；不是去重的区域同步事件数 |
+| `netcdf/lpw_station_frequency.nc` | 可直接用于空间分析的站点×阈值×等级频次与坐标 |
+| `netcdf/thresholds.nc` | 三个固定CF阈值及小时识别口径 |
+| `figures/frequency_*.png` | 三阈值×ALL/四等级，共15张频次地图 |
+| `manifest.json` | 事件数、时间范围、边界规则、图件清单、共享色标和完成状态 |
+| `cf_source.json`、`configuration.json` | 源CF信息及本次配置快照 |
+
+事件表按站点逐块追加，站内按时间排序。`pd.read_csv(path)`可直接读取 `.csv.gz`，不必手工解压。`duration_hours`和`valid_observations`相等；`lpw_class`是时长等级；`cumulative_cf_deficit=sum(阈值-CF)`单位为CF·小时，未计算电量。`missing_hours=0`表示事件内部不允许缺测；`missing_before/after`按分析中不可用小时标记，也包括被剔除的切出停机；另记录事件内切出小时及研究边界标记。
+
+频次表中的 `event_count` 是全研究期次数；`mean_events_per_calendar_year` 是次数除研究期覆盖的日历年数（不完整年也计一年）；`events_per_valid_year` 是次数除 `valid_hours/(365.2425×24)`，用于有效观测时长标准化。它们均不是低CF时间占比，后者另存 `low_cf_fraction`。`low_cf_hours`包含不足4小时的短低值段，`lpw_hours`仅包含合格事件。完全无有效观测的站点次数记NaN，有观测但没有事件记0。`ALL`为该阈值内四等级之和；不同阈值的次数不能相加。
+
+默认地图绘制 `event_count`；可配置为 `events_per_valid_year`。地图通过 `utils.plot_scat_map` 绘制离散站点，不进行空间插值；同一等级在三个CF阈值下共用离散色标，不同等级可用不同范围。南海子图复用本地省界，不下载Natural Earth文件。原始data和生成outputs仍全部忽略，不上传GitHub。
+
+当前配色为0次灰色，其余七档蓝—青—绿—黄—橙—红；累计次数的[0,1)档只包含0。每个等级按三个阈值合并后的频次分位点附近设置易读整数边界，避免频次集中于少数等距色段。这里仅调整绘图分箱，不改变CF阈值或事件定义。`LPW_MAP_LEVELS`可按等级指定边界字典，也可为所有等级共用列表或None（自动等距）；`LPW_MAP_COLORS`配置正频次色阶，`LPW_MAP_ZERO_COLOR`配置0次颜色。当前固定边界单位是累计次数，若切换有效年频次，应将边界设为None或使用匹配单位的新边界。
+
+仅重绘已有结果：
+
+```powershell
+conda run --no-capture-output -n main_env python code/run_wind_drought.py --plot-lpw-run outputs/lpw/run_20261021_203640_703000
+```
+
+重绘会更新PNG、`plot_configuration.json`和manifest中的绘图信息，保留原科学计算配置和所有事件、频次统计文件。
+
+## 保留的旧模式：区域日CF
+
+以下为 `--analysis-mode daily` 的原日尺度配置和输出说明，P20/P10/P5及日持续时间不用于当前小时LPW。
+
 唯一正式入口是 `code/run_wind_drought.py`。`code/` 顶层仅保留入口、配置和共用工具；质量检查与HTML报告独立放在 `code/quality_control/`，风旱专用计算位于 `code/wind_droughts/`，两个包分别承担质量控制与分析职责。原 `utils.py` 仅补充中文说明，函数实现保留，质量输出继续使用 `OUTPUT_DIR=../outputs/quality`。新计算不导入绘图工具，避免要求 cartopy/geopandas 等无关依赖。`examples/TEST.py` 保留交互探索用途，测试集中于 `tests/`，依赖清单位于项目根目录。
 
 ## 环境与运行

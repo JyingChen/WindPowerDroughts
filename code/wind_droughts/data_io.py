@@ -136,3 +136,51 @@ def resolve_capacity(installed_capacity_kw=None, rated_power_kw=None, turbine_co
     if not isinstance(turbine_count, int) or turbine_count < 1 or rated_power_kw is None or not np.isfinite(rated_power_kw) or rated_power_kw <= 0:
         raise ValueError("机组数量须为正整数且额定功率须为有限正数")
     return rated_power_kw * turbine_count
+
+
+def validate_hourly_cf(ds, expected_model=None):
+    """校验可复用的小时CF文件结构、站点坐标和计算参数，防止复用不同机型或高度的结果。"""
+    for key in ("cf", "cause"):
+        if key not in ds or ds[key].dims != ("time", "station"):
+            raise ValueError("站点LPW需要cf/cause(time, station)，不接受区域或日平均CF")
+    if ds.cf.attrs.get("units") != "1":
+        raise ValueError("CF文件须声明无量纲单位1")
+    index = pd.DatetimeIndex(ds.time.values)
+    if (index.empty or index.hasnans or index.has_duplicates or not index.is_monotonic_increasing
+            or not (index == index.floor("h")).all()):
+        raise ValueError("CF时间轴须为有序、无重复的整点小时")
+    for key in ("lat", "lon"):
+        if key not in ds.coords or ds[key].dims != ("station",) or not np.isfinite(ds[key].values).all():
+            raise ValueError("站点LPW地图需要每个站点的有限lat/lon坐标")
+    if (np.abs(ds.lat.values) > 90).any():
+        raise ValueError("纬度超出[-90,90]")
+    ids = ds.station_id.values if "station_id" in ds.coords else ds.station.values
+    if pd.Index(ids).has_duplicates or ds.sizes["station"] == 0:
+        raise ValueError("站点标识须唯一且非空")
+    for key, expected in (expected_model or {}).items():
+        actual = ds.cf.attrs.get(key, ds.attrs.get(key))
+        same = np.isclose(actual, expected, rtol=1e-10, atol=1e-12) if isinstance(expected, (int, float)) and isinstance(actual, (int, float)) else actual == expected
+        if not same:
+            raise ValueError(f"缓存CF参数不匹配：{key}，文件={actual}，配置={expected}；请重新计算CF")
+    return index
+
+
+def save_lpw_frequency(frequency, path, metadata):
+    """将站点×阈值×时长等级频次保存为NetCDF，保留经纬度与有效小时诊断。"""
+    metrics = ["event_count", "mean_events_per_calendar_year", "events_per_valid_year", "lpw_hours",
+               "mean_duration_hours", "max_duration_hours", "mean_event_cf", "min_event_cf",
+               "cumulative_cf_deficit", "boundary_event_count"]
+    result = frequency.set_index(["threshold_level", "lpw_class", "station"])[metrics].to_xarray()
+    positions = frequency.drop_duplicates("station").set_index("station").reindex(result.station.values)
+    result = result.assign_coords(lat=("station", positions.latitude.values), lon=("station", positions.longitude.values),
+                                  station_id=("station", positions.station_id.astype(str).values))
+    for key in ("expected_hours", "valid_hours", "valid_fraction", "source_missing_hours", "missing_timestamp_hours", "excluded_cut_out_hours"):
+        result[key] = ("station", positions[key].values)
+    thresholds = frequency.drop_duplicates("threshold_level").set_index("threshold_level")
+    result["cf_threshold"] = ("threshold_level", thresholds.reindex(result.threshold_level.values).cf_threshold.values)
+    result.attrs.update(metadata)
+    result.event_count.attrs["units"] = "events"
+    result.events_per_valid_year.attrs["meaning"] = "event_count / (valid_hours / (365.2425 * 24)); not time occupancy"
+    result.cumulative_cf_deficit.attrs["units"] = "CF hour"
+    result.to_netcdf(path, engine="netcdf4")
+    return result
